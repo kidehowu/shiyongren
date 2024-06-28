@@ -63,6 +63,8 @@ class Manager(object):
         self.n_multiplexing = n_multiplexing
         self.efficiency_1 = []
         self.efficiency_2 = []
+        self.y_label1 = torch.arange(0, 12).to(self.device)
+        self.y_label2 = torch.arange(12, 24).to(self.device)
 
         # Creates the train_step function for our model,
         # loss function and optimizer
@@ -101,19 +103,15 @@ class Manager(object):
         def perform_train_step_fn():
             self.model.train()
             # first_iter = True
-            losses = []
+            loss = 0.0
             yhat1 = self.model(self.x1, 0)
             yhat2 = self.model(self.x2, 1)
-            losses.append(self.loss_fn(yhat1, self.y1))
-            losses.append(self.loss_fn(yhat2, self.y2))
-            loss = torch.stack(losses)
-            ref_loss = loss.detach()
-            loss = (loss * self.alph).mean()
+            loss = loss + self.loss_fn(yhat1, self.y_label1)
+            loss = loss + self.loss_fn(yhat2, self.y_label2)
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
-            self.alph = torch.clamp(0.1 * (ref_loss - ref_loss.mean()) + self.alph, min=0)
-            return loss.item(), yhat1.sum(dim=(1, 2)).mean().item(), yhat2.sum(dim=(1, 2)).mean().item()
+            return loss.item()
 
         return perform_train_step_fn
 
@@ -147,10 +145,8 @@ class Manager(object):
         # To ensure reproducibility of the training process
         for epoch in range(n_epochs):
             self.total_epochs += 1
-            loss, efficiency_1, efficiency_2 = self.train_step_fn()
+            loss = self.train_step_fn()
             self.losses.append(loss)
-            self.efficiency_1.append(efficiency_1)
-            self.efficiency_2.append(efficiency_2)
 
     def save_checkpoint(self, filename):
         # Builds dictionary with all elements for resuming training
@@ -299,18 +295,12 @@ class Manager(object):
             fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
         return
 
-    def figure_1(self, dataloaders):
+    def figure_1(self, outputs):
         x, y = self.x1.cpu(), self.y1.cpu()
         x2, y2 = self.x2.cpu(), self.y2.cpu()
         x_abs = torch.abs(x)
         x_ang = torch.angle(x)
-        y_hats = []
-        with torch.no_grad():
-            self.model.eval()
-            yhat = self.model(self.x1, 0)
-            y_hats.append(yhat.detach().cpu())
-            yhat = self.model(self.x2, 1)
-            y_hats.append(yhat.detach().cpu())
+
         fig, axes = plt.subplots(12, 6, figsize=(3 * 6, 3 * 12))
         axes = axes.reshape(12, 6)
         dics = [
@@ -318,10 +308,10 @@ class Manager(object):
              'max': torch.max(x_abs)},
             {'x': x_ang, 'axes': axes[:, 1], 'title': '$\\angle Input_{}$', 'colormap': 'twilight', 'min': -np.pi,
              'max': np.pi},
-            {'x': y_hats[0], 'axes': axes[:, 2], 'title': '$\\lambda_1\\ |Output_{}|$', 'colormap': 'gray', 'min': 0,
-             'max': torch.max(y_hats[0])},
-            {'x': y_hats[1], 'axes': axes[:, 3], 'title': '$\\lambda_2\\ |Output_{}|$', 'colormap': 'gray', 'min': 0,
-             'max': torch.max(y_hats[1])},
+            {'x': outputs[:12, :, :], 'axes': axes[:, 2], 'title': '$\\lambda_1\\ |Output_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': None},
+            {'x': outputs[12:, :, :], 'axes': axes[:, 3], 'title': '$\\lambda_2\\ |Output_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': None},
             {'x': y, 'axes': axes[:, 4], 'title': '$|Target_{}|$', 'colormap': 'gray', 'min': 0,
              'max': torch.max(y)},
             {'x': y2, 'axes': axes[:, 5], 'title': '$|Target_{}|$', 'colormap': 'gray', 'min': 0,
@@ -405,3 +395,13 @@ class Manager(object):
         ax.set_ylabel('Loss')
         fig.tight_layout()
         return tracking, fig
+
+    def get_output(self, layers):
+        self.attach_hooks(layers)
+        with torch.no_grad():
+            self.model.eval()
+            yhat1 = self.model(self.x1, 0)
+            yhat2 = self.model(self.x2, 1)
+        self.model.train()
+        self.remove_hooks()
+        return self.visualization['detect']

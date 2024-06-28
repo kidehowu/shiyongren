@@ -63,13 +63,46 @@ class ModulationLayer(nn.Module):
 
 
 class DetectionPlane(nn.Module):
-    def __init__(self, margin, total_pad):
+    def __init__(self, margin, total_pad, size):
         super(DetectionPlane, self).__init__()
         self.start, self.end = total_pad + margin, -(total_pad + margin)
 
     def forward(self, x):
         x = x[:, self.start:self.end, self.start:self.end]
         x = (x * torch.conj(x)).real
+        return x
+
+
+class Logits(nn.Module):
+    def __init__(self, size):
+        super(Logits, self).__init__()
+        self.N = size
+        rows = np.arange(50, 360, 60)
+        cols = np.arange(50, 360, 100)
+        x, y = np.meshgrid(rows, cols)
+        self.centers = zip(x.reshape(-1), y.reshape(-1))
+        gaussian_tensors = []
+        for center in self.centers:
+            gaussian_tensor = self.create_displaced_gaussian(center=center, sigma=12)
+            gaussian_tensors.append(gaussian_tensor)
+        self.gaussians = nn.Parameter(torch.stack(gaussian_tensors, dim=-1), requires_grad=False)
+
+    def create_displaced_gaussian(self, center=None, sigma=10.0):
+        if center is None:
+            center = (self.N / 2, self.N / 2)  # Default to center, adjust this as needed
+        x = torch.arange(self.N)
+        y = torch.arange(self.N)
+
+        xv, yv = torch.meshgrid(x, y, indexing='ij')
+        gaussian = torch.exp(-((xv - center[0]) ** 2 + (yv - center[1]) ** 2) / (2 * sigma ** 2))
+
+        return gaussian
+
+    def forward(self, x):
+        x = x.unsqueeze(-1)
+        x = x.expand(-1, -1, -1, 24)
+        x = x * self.gaussians
+        x = x.sum(dim=(1, 2))
         return x
 
 
@@ -85,7 +118,8 @@ class D2NNmodel(nn.Module):
         self.modulation_2 = ModulationLayer(device, n_padd, size)
         self.modulation_3 = ModulationLayer(device, n_padd, size)
         self.modulation_4 = ModulationLayer(device, n_padd, size)
-        self.detect = DetectionPlane(margin, self.total_pad)
+        self.detect = DetectionPlane(margin, self.total_pad, size)
+        self.logits = Logits(size)
 
     def featurizer(self, x, i):
         x = F.pad(x, pad=(self.total_pad, self.total_pad, self.total_pad, self.total_pad))
@@ -98,6 +132,7 @@ class D2NNmodel(nn.Module):
         x = self.modulation_4(x, i)
         x = self.propagation_4(x, i)
         x = self.detect(x)
+        x = self.logits(x)
         return x
 
     def forward(self, x, i):
