@@ -5,6 +5,8 @@ import torch.optim as optim
 import random
 import matplotlib.pyplot as plt
 import sys
+from copy import deepcopy
+from torch.optim.lr_scheduler import LambdaLR
 
 
 def set_seed(seed=42):
@@ -57,8 +59,10 @@ class Manager(object):
 
         self.visualization = {}
         self.handles = {}
-        self.alph = torch.ones(n_multiplexing, device=self.device, requires_grad=False)
+        self.alph = torch.ones(2, device=self.device, requires_grad=False)
         self.n_multiplexing = n_multiplexing
+        self.efficiency_1 = []
+        self.efficiency_2 = []
 
         # Creates the train_step function for our model,
         # loss function and optimizer
@@ -86,18 +90,22 @@ class Manager(object):
         # So they can be referred to later
         self.train_loaders_list = train_loaders_list
         self.val_loaders_list = val_loaders_list
+        x1, y1 = next(iter(self.train_loaders_list[0]))
+        x2, y2 = next(iter(self.train_loaders_list[1]))
+        self.x1 = x1.to(self.device)
+        self.y1 = y1.to(self.device)
+        self.x2 = x2.to(self.device)
+        self.y2 = y2.to(self.device)
 
     def _make_train_step_fn(self):
-        def perform_train_step_fn(iters_list):
+        def perform_train_step_fn():
             self.model.train()
             # first_iter = True
             losses = []
-            for i, it in enumerate(iters_list):
-                x, y = next(it)
-                x = x.to(self.device)
-                y = y.to(self.device)
-                yhat = self.model(x, i)
-                losses.append(self.loss_fn(yhat, y))
+            yhat1 = self.model(self.x1, 0)
+            yhat2 = self.model(self.x2, 1)
+            losses.append(self.loss_fn(yhat1, self.y1))
+            losses.append(self.loss_fn(yhat2, self.y2))
             loss = torch.stack(losses)
             ref_loss = loss.detach()
             loss = (loss * self.alph).mean()
@@ -105,7 +113,7 @@ class Manager(object):
             self.optimizer.step()
             self.optimizer.zero_grad()
             self.alph = torch.clamp(0.1 * (ref_loss - ref_loss.mean()) + self.alph, min=0)
-            return loss.item()
+            return loss.item(), yhat1.sum(dim=(1, 2)).mean().item(), yhat2.sum(dim=(1, 2)).mean().item()
 
         return perform_train_step_fn
 
@@ -114,62 +122,15 @@ class Manager(object):
             self.model.eval()
             # first_iter = True
             losses = []
-            for i, it in enumerate(iters_list):
-                x, y = next(it)
-                x = x.to(self.device)
-                y = y.to(self.device)
-                yhat = self.model(x, i)
-                losses.append(self.loss_fn(yhat, y))
+            yhat1 = self.model(self.x1, 0)
+            yhat2 = self.model(self.x2, 1)
+            losses.append(self.loss_fn(yhat1, self.y1))
+            losses.append(self.loss_fn(yhat2, self.y2))
             loss = torch.stack(losses)
             loss = (loss * self.alph).mean()
             return loss.item()
 
         return perform_val_step_fn
-
-    def _run_all_mini_batch(self, validation=False):
-        # The mini-batch can be used with both loaders
-        # The argument `validation`defines which loader and
-        # corresponding step function is going to be used
-        if validation:
-            data_loaders_list = self.val_loaders_list
-            step_fn = self.val_step_fn
-        else:
-            data_loaders_list = self.train_loaders_list
-            step_fn = self.train_step_fn
-
-        if data_loaders_list is None:
-            return None
-
-        data_loader_iterators = [iter(loader) for loader in data_loaders_list]
-        mini_batch_losses = []
-        for i in range(len(data_loaders_list[0])):
-            mini_batch_loss = step_fn(data_loader_iterators)
-            mini_batch_losses.append(mini_batch_loss)
-
-        loss = np.mean(mini_batch_losses)
-        return loss
-
-    def _mini_batch_schedulers(self, frac_epoch):
-        if self.scheduler:
-            if self.is_batch_lr_scheduler:
-                if isinstance(self.scheduler, optim.lr_scheduler.CosineAnnealingWarmRestarts):
-                    self.scheduler.step(self.total_epochs + frac_epoch)
-                else:
-                    self.scheduler.step()
-
-                current_lr = list(map(lambda d: d['lr'], self.scheduler.optimizer.state_dict()['param_groups']))
-                self.learning_rates.append(current_lr)
-
-    def _epoch_schedulers(self, val_loss):
-        if self.scheduler:
-            if not self.is_batch_lr_scheduler:
-                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(val_loss)
-                else:
-                    self.scheduler.step()
-
-                current_lr = list(map(lambda d: d['lr'], self.scheduler.optimizer.state_dict()['param_groups']))
-                self.learning_rates.append(current_lr)
 
     def set_seed(self, seed=42):
         torch.backends.cudnn.deterministic = True
@@ -184,16 +145,12 @@ class Manager(object):
 
     def train(self, n_epochs, seed=42):
         # To ensure reproducibility of the training process
-        self.set_seed(seed)
-
         for epoch in range(n_epochs):
             self.total_epochs += 1
-            loss = self._run_all_mini_batch(validation=False)
+            loss, efficiency_1, efficiency_2 = self.train_step_fn()
             self.losses.append(loss)
-
-            with torch.no_grad():
-                val_loss = self._run_all_mini_batch(validation=True)
-                self.val_losses.append(val_loss)
+            self.efficiency_1.append(efficiency_1)
+            self.efficiency_2.append(efficiency_2)
 
     def save_checkpoint(self, filename):
         # Builds dictionary with all elements for resuming training
@@ -237,41 +194,19 @@ class Manager(object):
         plt.tight_layout()
         return fig
 
+    def plot_efficiency(self):
+        fig = plt.figure(figsize=(10, 4))
+        plt.plot(self.efficiency_1, label='efficiency_1 Loss', c='b')
+        plt.plot(self.efficiency_2, label='efficiency_2 Loss', c='r')
+        plt.ylim([0, 1])
+        plt.xlabel('Epochs')
+        plt.ylabel('Efficiency')
+        plt.legend()
+        plt.tight_layout()
+        return fig
+
     def set_optimizer(self, optimizer):
         self.optimizer = optimizer
-
-    @staticmethod
-    def _visualize_tensors(axs, x, y=None, yhat=None, layer_name='', title=None):
-        # The number of images is the number of subplots in a row
-        n_images = len(axs)
-        # Gets max and min values for scaling the grayscale
-        minv, maxv = np.min(x[:n_images]), np.max(x[:n_images])
-        # For each image
-        for j, image in enumerate(x[:n_images]):
-            ax = axs[j]
-            # Sets title, labels, and removes ticks
-            if title is not None:
-                ax.set_title('{} #{}'.format(title, j), fontsize=12)
-            '''ax.set_ylabel(
-                '{}\n{}x{}'.format(layer_name, *np.atleast_2d(image).shape),
-                rotation=0, labelpad=40
-            )'''
-            xlabel1 = '' if y is None else '\nLabel: {}'.format(y[j])
-            xlabel2 = '' if yhat is None else '\nPredicted: {}'.format(yhat[j])
-            xlabel = '{}{}'.format(xlabel1, xlabel2)
-            if len(xlabel):
-                ax.set_xlabel(xlabel, fontsize=12)
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-            # Plots weight as an image
-            ax.imshow(
-                np.atleast_2d(image.squeeze()),
-                cmap='gray',
-                vmin=minv,
-                vmax=maxv
-            )
-        return
 
     @staticmethod
     def _visualize_phases(fig, axs, x, y=None, yhat=None, layer_name='', title=None):
@@ -279,9 +214,6 @@ class Manager(object):
         n_images = len(axs)
         # Gets max and min values for scaling the grayscale
         minv, maxv = np.min(x[:n_images]), np.max(x[:n_images])
-        lambd_mean = 0.8e-3
-        hmin = 0.25 * lambd_mean
-        hmax = 1.5 * lambd_mean
         # For each image
         for j, image in enumerate(x[:n_images]):
             ax = axs[j]
@@ -299,9 +231,7 @@ class Manager(object):
         cbar_ax = fig.add_axes([0.92, 0.12, 0.01, 0.75])  # Adjust these values as needed
         cbar = fig.colorbar(im, cax=cbar_ax)
         # Set custom tick positions
-        cbar.set_ticks([hmin, hmax])
         # Set custom tick labels
-        cbar.set_ticklabels(['0.25 $\\lambda$', '1.50 $\\lambda$'])
 
         return
 
@@ -342,15 +272,12 @@ class Manager(object):
         # Clear the dict, as all hooks have been removed
         self.handles = {}
 
-    def visualize_height_mask(self, layers_name, hmin, hmax, bit_depth):
+    def visualize_voltage_mask(self, layers_name):
         n_weights = []
-        linspace = np.linspace(hmin, hmax, 2 ** bit_depth)
         for name in layers_name:
             layer = getattr(self.model, name)
-            weights = layer.height.data.detach().cpu().numpy()
-            weights = (np.sin(weights) + 1) / 2 * (2 ** bit_depth - 1)
-            weights = np.round(weights).astype(int)
-            weights = linspace[weights]
+            weights = layer.normalized_voltage.data.detach().cpu()
+            weights = torch.sigmoid(weights).numpy()
             n_weights.append(weights)
 
         n_channels = len(layers_name)
@@ -362,26 +289,6 @@ class Manager(object):
         )
         return fig
 
-    def get_transform_tensor(self, A):
-        input_fov = self.model.input_fov
-        x = torch.eye(input_fov ** 2)
-        x = x.view((input_fov ** 2, input_fov, input_fov))
-        A_hat = []
-        with torch.no_grad():
-            self.model.eval()
-            x = x.to(self.device)
-            for i in range(self.n_multiplexing):
-                yhat = self.model(x, i)
-                yhat = yhat.view(yhat.size(0), -1)
-                yhat = torch.t(yhat)
-                A_hat.append(yhat)
-            A_hat = torch.stack(A_hat).detach().cpu()
-        denomi = torch.norm(A_hat, dim=(1, 2)) ** 2
-        nomi = (A * torch.conj(A_hat)).sum(dim=(1, 2))
-        factor = (nomi / denomi).unsqueeze(-1).unsqueeze(-1)
-        A_hat = factor * A_hat
-        return A_hat
-
     def _helper_plot(self, fig, dic):
         for i in range(len(dic['axes'])):
             ax = dic['axes'][i]
@@ -392,71 +299,109 @@ class Manager(object):
             fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
         return
 
-    def figure_1(self, A):
-        Ah = self.get_transform_tensor(A)
-        A_abs = torch.abs(A)
-        A_ang = torch.angle(A)
-        Ah_abs = torch.abs(Ah)
-        Ah_ang = torch.angle(Ah)
-        dA = torch.abs(A - Ah)
-        mean_error = dA.mean()
-        fig, axes = plt.subplots(4, 5, figsize=(3 * 5, 3 * 4))
-        axes = axes.reshape(4, 5)
-        dics = [
-            {'x': A_abs, 'axes': axes[:, 0], 'title': '$|A_{}|$', 'colormap': 'gray', 'min': 0, 'max': 1},
-            {'x': A_ang, 'axes': axes[:, 1], 'title': '$\\angle A_{}$', 'colormap': 'twilight', 'min': -np.pi,
-             'max': np.pi},
-            {'x': Ah_abs, 'axes': axes[:, 2], 'title': '$|\\hat A_{}|$', 'colormap': 'gray', 'min': 0, 'max': 1},
-            {'x': Ah_ang, 'axes': axes[:, 3], 'title': '$\\angle \\hat A_{}$', 'colormap': 'twilight', 'min': -np.pi,
-             'max': np.pi},
-            {'x': dA, 'axes': axes[:, 4], 'title': '$|A - \\hat A_{}|$', 'colormap': 'afmhot', 'min': 0,
-             'max': torch.max(dA)}
-        ]
-        for dic in dics:
-            self._helper_plot(fig, dic)
-        plt.show()
-        return fig, mean_error
-
-    def figure_2(self):
-        a = iter(self.val_loaders_list[0])
-        x, y = next(a)
-        with torch.no_grad():
-            self.model.eval()
-            yhat = x.to(self.device)
-            yhat = self.model(yhat, 0)
-            yhat = yhat.detach().cpu()
-        denomi = torch.norm(yhat, dim=(1, 2)) ** 2
-        nomi = (y * torch.conj(yhat)).sum(dim=(1, 2))
-        factor = (nomi / denomi).unsqueeze(-1).unsqueeze(-1)
-        yh = factor * yhat
+    def figure_1(self, dataloaders):
+        x, y = self.x1.cpu(), self.y1.cpu()
+        x2, y2 = self.x2.cpu(), self.y2.cpu()
         x_abs = torch.abs(x)
         x_ang = torch.angle(x)
-        y_abs = torch.abs(y)
-        y_ang = torch.angle(y)
-        yh_abs = torch.abs(yh)
-        yh_ang = torch.angle(yh)
-        dy_abs = torch.abs(y - yh)
-        dy_ang = torch.abs(torch.angle(y) - torch.angle(yh))
-        # mean_error = dy_abs.mean()
-        fig, axes = plt.subplots(4, 8, figsize=(3.5 * 8, 3 * 4))
-        axes = axes.reshape(4, 8)
+        y_hats = []
+        with torch.no_grad():
+            self.model.eval()
+            yhat = self.model(self.x1, 0)
+            y_hats.append(yhat.detach().cpu())
+            yhat = self.model(self.x2, 1)
+            y_hats.append(yhat.detach().cpu())
+        fig, axes = plt.subplots(12, 6, figsize=(3 * 6, 3 * 12))
+        axes = axes.reshape(12, 6)
         dics = [
-            {'x': x_abs, 'axes': axes[:, 0], 'title': '$|x_{}|$', 'colormap': 'gray', 'min': 0,
+            {'x': x_abs, 'axes': axes[:, 0], 'title': '$|Input_{}|$', 'colormap': 'jet', 'min': 0,
              'max': torch.max(x_abs)},
-            {'x': x_ang, 'axes': axes[:, 1], 'title': '$\\angle x_{}$', 'colormap': 'twilight', 'min': -np.pi,
+            {'x': x_ang, 'axes': axes[:, 1], 'title': '$\\angle Input_{}$', 'colormap': 'twilight', 'min': -np.pi,
              'max': np.pi},
-            {'x': y_abs, 'axes': axes[:, 2], 'title': '$|y_{}|$', 'colormap': 'gray', 'min': 0, 'max': torch.max(y_abs)},
-            {'x': y_ang, 'axes': axes[:, 3], 'title': '$\\angle y_{}$', 'colormap': 'twilight', 'min': -np.pi,
-             'max': np.pi},
-            {'x': yh_abs, 'axes': axes[:, 4], 'title': '$|\\hat y_{}|$', 'colormap': 'gray', 'min': 0, 'max': torch.max(yh_abs)},
-            {'x': yh_ang, 'axes': axes[:, 5], 'title': '$\\angle \\hat y_{}$', 'colormap': 'twilight', 'min': -np.pi,
-             'max': np.pi},
-            {'x': dy_abs, 'axes': axes[:, 6], 'title': '$|y - \\hat y_{}|$', 'colormap': 'afmhot', 'min': 0,
-             'max': torch.max(dy_abs)},
-            {'x': dy_ang, 'axes': axes[:, 7], 'title': '$|\\angle y - \\angle \\hat y_{}|$', 'colormap': 'afmhot', 'min': 0,
-             'max': np.pi}
+            {'x': y_hats[0], 'axes': axes[:, 2], 'title': '$\\lambda_1\\ |Output_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': torch.max(y_hats[0])},
+            {'x': y_hats[1], 'axes': axes[:, 3], 'title': '$\\lambda_2\\ |Output_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': torch.max(y_hats[1])},
+            {'x': y, 'axes': axes[:, 4], 'title': '$|Target_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': torch.max(y)},
+            {'x': y2, 'axes': axes[:, 5], 'title': '$|Target_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': torch.max(y2)}
         ]
         for dic in dics:
             self._helper_plot(fig, dic)
         plt.show()
         return fig
+
+    def eff(self):
+        with torch.no_grad():
+            self.model.eval()
+            yhat = self.model(self.x1, 0).sum(dim=(1, 2)).mean().detach().cpu()
+            print(yhat, '1')
+            yhat = self.model(self.x2, 1).sum(dim=(1, 2)).mean().detach().cpu()
+            print(yhat, '2')
+
+    def lr_range_test(self, data_loader, end_lr, num_iter=100, step_mode='exp', alpha=0.05, ax=None):
+        # Since the test updates both model and optimizer we need to store
+        # their initial states to restore them in the end
+        previous_states = {'model': deepcopy(self.model.state_dict()),
+                           'optimizer': deepcopy(self.optimizer.state_dict())}
+        # Retrieves the learning rate set in the optimizer
+        start_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+        # Builds a custom function and corresponding scheduler
+        lr_fn = make_lr_fn(start_lr, end_lr, num_iter)
+        scheduler = LambdaLR(self.optimizer, lr_lambda=lr_fn)
+
+        # Variables for tracking results and iterations
+        tracking = {'loss': [], 'lr': []}
+        iteration = 0
+
+        # If there are more iterations than mini-batches in the data loader,
+        # it will have to loop over it more than once
+        while (iteration < num_iter):
+            # That's the typical mini-batch inner loop
+            for x_batch, y_batch in data_loader:
+                x_batch = x_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+                # Step 1
+                yhat = self.model(x_batch, 0)
+                # Step 2
+                loss = self.loss_fn(yhat, y_batch)
+                # Step 3
+                loss.backward()
+
+                # Here we keep track of the losses (smoothed)
+                # and the learning rates
+                tracking['lr'].append(scheduler.get_last_lr()[0])
+                if iteration == 0:
+                    tracking['loss'].append(loss.item())
+                else:
+                    prev_loss = tracking['loss'][-1]
+                    smoothed_loss = alpha * loss.item() + (1 - alpha) * prev_loss
+                    tracking['loss'].append(smoothed_loss)
+
+                iteration += 1
+                # Number of iterations reached
+                if iteration == num_iter:
+                    break
+
+                # Step 4
+                self.optimizer.step()
+                scheduler.step()
+                self.optimizer.zero_grad()
+
+        # Restores the original states
+        self.optimizer.load_state_dict(previous_states['optimizer'])
+        self.model.load_state_dict(previous_states['model'])
+
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.get_figure()
+        ax.plot(tracking['lr'], tracking['loss'])
+        if step_mode == 'exp':
+            ax.set_xscale('log')
+        ax.set_xlabel('Learning Rate')
+        ax.set_ylabel('Loss')
+        fig.tight_layout()
+        return tracking, fig

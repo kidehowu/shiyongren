@@ -63,12 +63,12 @@ def plot_cosine_similarity_matrix(data):
 
 def mse_loss():
     def mse(output, target):
-        target = F.normalize(target, dim=(1, 2))
         denomi = torch.norm(output, dim=(1, 2)) ** 2
-        nomi = (target * torch.conj(output)).sum(dim=(1, 2))
+        nomi = (target * output).sum(dim=(1, 2))
         factor = (nomi / denomi).unsqueeze(-1).unsqueeze(-1)
         x = target - factor * output
-        x = (x * torch.conj(x)).real.mean()
+        # x = target - output
+        x = (x ** 2).sum()
         return x
 
     return mse
@@ -80,6 +80,11 @@ def shiyong_loader(load_dic, batch_size):
     for dic in load_dic:
         mat_data = scipy.io.loadmat(dic['path'])
         a = torch.from_numpy(mat_data[dic['vari_name']]).permute(2, 0, 1, 3)
+        a = F.normalize(a, dim=(1, 2)).to(torch.complex64)
+        if dic['path']=='output_filed_lamda_12.mat':
+            a = (a * torch.conj(a)).real.to(torch.float32)
+            a[:6, :, :, 1] = torch.cat((a[:6, :, 100:, 1], a[:6, :, :100, 1]), dim=2)
+            a[6:, :, :, 1] = torch.cat((a[6:, :, 300:, 1], a[6:, :, :300, 1]), dim=2)
         datasets0.append(a[:, :, :, 0])
         datasets1.append(a[:, :, :, 1])
     dataset0 = TensorDataset(datasets0[0], datasets0[1])
