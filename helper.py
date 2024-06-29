@@ -73,6 +73,34 @@ def mse_loss():
 
     return mse
 
+
+def flat_top_gaussian(x, y, x0, y0, sigma_x, sigma_y, A, flat_height):
+    gauss = A * np.exp(-((x - x0) ** 2 / (2 * sigma_x ** 2) + (y - y0) ** 2 / (2 * sigma_y ** 2)))
+    flat_gauss = np.minimum(gauss, flat_height)
+    return flat_gauss
+
+
+def convex_loss():
+    x = np.arange(800)
+    y = x
+    x, y = np.meshgrid(x, y)
+
+    # Parameters
+    x0, y0 = 400, 400  # center
+    sigma_x, sigma_y = 150, 150  # widths
+    A = 1  # amplitude
+    flat_height = 0.6  # Height at which to truncate the peak
+
+    # Generate the flat-top Gaussian
+    z = torch.from_numpy(flat_top_gaussian(x, y, x0, y0, sigma_x, sigma_y, A, flat_height)).to(torch.float32).to('cuda')
+
+    def convex(output):
+        x = -(output * z).sum()
+        return x
+
+    return convex
+
+
 def shiyong_loader(load_dic, batch_size):
     dataloaders = []
     datasets0 = []
@@ -81,10 +109,13 @@ def shiyong_loader(load_dic, batch_size):
         mat_data = scipy.io.loadmat(dic['path'])
         a = torch.from_numpy(mat_data[dic['vari_name']]).permute(2, 0, 1, 3)
         a = F.normalize(a, dim=(1, 2)).to(torch.complex64)
-        if dic['path']=='output_filed_lamda_12.mat':
+        if dic['path'] == 'output_field_lamda_12.mat':
             a = (a * torch.conj(a)).real.to(torch.float32)
-            a[:6, :, :, 1] = torch.cat((a[:6, :, 100:, 1], a[:6, :, :100, 1]), dim=2)
-            a[6:, :, :, 1] = torch.cat((a[6:, :, 300:, 1], a[6:, :, :300, 1]), dim=2)
+            # a[:6, :, :, 1] = torch.cat((a[:6, :, 100:, 1], a[:6, :, :100, 1]), dim=2)
+            # a[6:, :, :, 1] = torch.cat((a[6:, :, 300:, 1], a[6:, :, :300, 1]), dim=2)
+            # a = F.pad(a, pad=(0, 0, 200, 200, 200, 200))
+        if dic['path'] == 'input_field_lamda_12.mat':
+            a = torch.cat((a[:6, :, :, :], torch.flip(a[6:, :, :, :], [0])), dim=0)
         datasets0.append(a[:, :, :, 0])
         datasets1.append(a[:, :, :, 1])
     dataset0 = TensorDataset(datasets0[0], datasets0[1])

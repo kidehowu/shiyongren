@@ -31,6 +31,32 @@ def make_lr_fn(start_lr, end_lr, num_iter, step_mode='exp'):
     return lr_fn
 
 
+def create_gaussians(sig, switch):
+    def create_gaussian(center, sigma=150):
+        gauss = torch.exp(
+            -(xx - center[0]) ** 2 / (2 * sigma ** 2) - (yy - center[1]) ** 2 / (2 * sigma ** 2))
+        return gauss
+
+    x = torch.arange(400)
+    y = x
+    xx, yy = torch.meshgrid(x, y, indexing='ij')
+    if switch == 0:
+        centers = [(75, 95), (125, 95), (175, 95), (225, 95), (275, 95), (325, 95),
+                   (75, 235), (125, 235), (175, 235), (225, 235), (275, 235), (325, 235)
+                   ]
+    else:
+        centers = [(75, 165), (125, 165), (175, 165), (225, 165), (275, 165), (325, 165),
+                   (75, 305), (125, 305), (175, 305), (225, 305), (275, 305), (325, 305)
+                   ]
+    gaussians = []
+    for center in centers:
+        gaussian = create_gaussian(center, sig)
+        gaussians.append(gaussian)
+    gaussians = torch.stack(gaussians, dim=0)
+    gaussians = gaussians / gaussians.sum(dim=(1, 2)).unsqueeze(-1).unsqueeze(-1)
+    return gaussians
+
+
 class Manager(object):
     def __init__(self, model, loss_fn, optimizer, n_multiplexing):
         # Here we define the attributes of our class
@@ -60,9 +86,12 @@ class Manager(object):
         self.visualization = {}
         self.handles = {}
         self.alph = torch.ones(2, device=self.device, requires_grad=False)
+        self.alph = torch.tensor([1, 2], device=self.device, requires_grad=False)
         self.n_multiplexing = n_multiplexing
         self.efficiency_1 = []
         self.efficiency_2 = []
+        self.gaussians_1 = create_gaussians(sig=20, switch=0).to(self.device)
+        self.gaussians_2 = create_gaussians(sig=20, switch=1).to(self.device)
 
         # Creates the train_step function for our model,
         # loss function and optimizer
@@ -96,6 +125,8 @@ class Manager(object):
         self.y1 = y1.to(self.device)
         self.x2 = x2.to(self.device)
         self.y2 = y2.to(self.device)
+        self.y1 = self.gaussians_1
+        self.y2 = self.gaussians_2
 
     def _make_train_step_fn(self):
         def perform_train_step_fn():
@@ -106,14 +137,18 @@ class Manager(object):
             yhat2 = self.model(self.x2, 1)
             losses.append(self.loss_fn(yhat1, self.y1))
             losses.append(self.loss_fn(yhat2, self.y2))
+            # yhat1 = yhat1[:, 200:-200, 200:-200].sum(dim=(1, 2)).mean()
+            # yhat2 = yhat2[:, 200:-200, 200:-200].sum(dim=(1, 2)).mean()
+            yhat1 = yhat1.sum(dim=(1, 2)).mean()
+            yhat2 = yhat2.sum(dim=(1, 2)).mean()
             loss = torch.stack(losses)
             ref_loss = loss.detach()
-            loss = (loss * self.alph).mean()
+            loss = (loss * self.alph).mean()  # - 0.002 * torch.log(yhat2)
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
-            self.alph = torch.clamp(0.1 * (ref_loss - ref_loss.mean()) + self.alph, min=0)
-            return loss.item(), yhat1.sum(dim=(1, 2)).mean().item(), yhat2.sum(dim=(1, 2)).mean().item()
+            self.alph = torch.clamp(0.3 * (ref_loss - ref_loss.mean()) + self.alph, min=0)
+            return loss.item(), yhat1.item(), yhat2.item()
 
         return perform_train_step_fn
 
@@ -124,8 +159,8 @@ class Manager(object):
             losses = []
             yhat1 = self.model(self.x1, 0)
             yhat2 = self.model(self.x2, 1)
-            losses.append(self.loss_fn(yhat1, self.y1))
-            losses.append(self.loss_fn(yhat2, self.y2))
+            losses.append(self.loss_fn(yhat1))
+            losses.append(self.loss_fn(yhat2))
             loss = torch.stack(losses)
             loss = (loss * self.alph).mean()
             return loss.item()
@@ -174,19 +209,19 @@ class Manager(object):
 
         # Restore state for model and optimizer
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-        self.total_epochs = checkpoint['epoch']
-        self.losses = checkpoint['loss']
-        self.val_losses = checkpoint['val_loss']
-        self.alph = checkpoint['alpha'].to(self.device)
+        # self.total_epochs = checkpoint['epoch']
+        # self.losses = checkpoint['loss']
+        # self.val_losses = checkpoint['val_loss']
+        # self.alph = checkpoint['alpha'].to(self.device)
 
         self.model.train()  # always use TRAIN for resuming training
 
     def plot_losses(self):
         fig = plt.figure(figsize=(10, 4))
         plt.plot(self.losses, label='Training Loss', c='b')
-        plt.plot(self.val_losses, label='Validation Loss', c='r')
+        # plt.plot(self.val_losses, label='Validation Loss', c='r')
         plt.yscale('log')
         plt.xlabel('Epochs')
         plt.ylabel('Loss')
@@ -198,7 +233,7 @@ class Manager(object):
         fig = plt.figure(figsize=(10, 4))
         plt.plot(self.efficiency_1, label='efficiency_1 Loss', c='b')
         plt.plot(self.efficiency_2, label='efficiency_2 Loss', c='r')
-        plt.ylim([0, 1])
+        # plt.ylim([0, 1])
         plt.xlabel('Epochs')
         plt.ylabel('Efficiency')
         plt.legend()
@@ -311,7 +346,7 @@ class Manager(object):
             y_hats.append(yhat.detach().cpu())
             yhat = self.model(self.x2, 1)
             y_hats.append(yhat.detach().cpu())
-        fig, axes = plt.subplots(12, 6, figsize=(3 * 6, 3 * 12))
+        fig, axes = plt.subplots(12, 6, figsize=(4 * 6, 3 * 12))
         axes = axes.reshape(12, 6)
         dics = [
             {'x': x_abs, 'axes': axes[:, 0], 'title': '$|Input_{}|$', 'colormap': 'jet', 'min': 0,
@@ -332,15 +367,39 @@ class Manager(object):
         plt.show()
         return fig
 
-    def eff(self):
+    def eff(self, range, switch):
         with torch.no_grad():
             self.model.eval()
-            yhat = self.model(self.x1, 0).sum(dim=(1, 2)).mean().detach().cpu()
-            print(yhat, '1')
-            yhat = self.model(self.x2, 1).sum(dim=(1, 2)).mean().detach().cpu()
-            print(yhat, '2')
+            yhat1 = self.model(self.x1, 0).detach().cpu()
+            yhat2 = self.model(self.x2, 1).detach().cpu()
+            self.model.train()
+        points_1 = [(75, 95), (125, 95), (175, 95), (225, 95), (275, 95), (325, 95),
+                    (75, 235), (125, 235), (175, 235), (225, 235), (275, 235), (325, 235)
+                    ]
+        points_2 = [(75, 165), (125, 165), (175, 165), (225, 165), (275, 165), (325, 165),
+                    (75, 305), (125, 305), (175, 305), (225, 305), (275, 305), (325, 305)
+                    ]
+        if switch:
+            points_2 = points_1
+        eff_1 = []
+        eff_2 = []
+        for i, (x, y) in enumerate(points_1):
+            # x += 200
+            # y += 200
+            tensor = yhat1[i][x - range:x + range, y - range:y + range]
+            tensor = tensor.sum().numpy()
+            eff_1.append(tensor)
+        for i, (x, y) in enumerate(points_2):
+            # x += 200
+            # y += 200
+            tensor = yhat2[i][x - range:x + range, y - range:y + range]
+            tensor = tensor.sum().numpy()
+            eff_2.append(tensor)
+        print(np.mean(eff_1))
+        print(np.mean(eff_2))
+        # yhat = self.model(self.x2, 1).sum(dim=(1, 2)).mean().detach().cpu()
 
-    def lr_range_test(self, data_loader, end_lr, num_iter=100, step_mode='exp', alpha=0.05, ax=None):
+    def lr_range_test(self, start_lr, end_lr, num_iter=100, step_mode='exp', alpha=0.05, ax=None):
         # Since the test updates both model and optimizer we need to store
         # their initial states to restore them in the end
         previous_states = {'model': deepcopy(self.model.state_dict()),
@@ -359,36 +418,29 @@ class Manager(object):
         # If there are more iterations than mini-batches in the data loader,
         # it will have to loop over it more than once
         while (iteration < num_iter):
-            # That's the typical mini-batch inner loop
-            for x_batch, y_batch in data_loader:
-                x_batch = x_batch.to(self.device)
-                y_batch = y_batch.to(self.device)
-                # Step 1
-                yhat = self.model(x_batch, 0)
-                # Step 2
-                loss = self.loss_fn(yhat, y_batch)
-                # Step 3
-                loss.backward()
+            yhat1 = self.model(self.x1, 0)
+            yhat2 = self.model(self.x2, 0)
+            loss = self.loss_fn(yhat1, self.y1)
+            loss = loss + self.loss_fn(yhat2, self.y2)
+            loss.backward()
 
-                # Here we keep track of the losses (smoothed)
-                # and the learning rates
-                tracking['lr'].append(scheduler.get_last_lr()[0])
-                if iteration == 0:
-                    tracking['loss'].append(loss.item())
-                else:
-                    prev_loss = tracking['loss'][-1]
-                    smoothed_loss = alpha * loss.item() + (1 - alpha) * prev_loss
-                    tracking['loss'].append(smoothed_loss)
+            tracking['lr'].append(scheduler.get_last_lr()[0])
+            if iteration == 0:
+                tracking['loss'].append(loss.item())
+            else:
+                prev_loss = tracking['loss'][-1]
+                smoothed_loss = alpha * loss.item() + (1 - alpha) * prev_loss
+                tracking['loss'].append(smoothed_loss)
 
-                iteration += 1
-                # Number of iterations reached
-                if iteration == num_iter:
-                    break
+            iteration += 1
+            # Number of iterations reached
+            if iteration == num_iter:
+                break
 
-                # Step 4
-                self.optimizer.step()
-                scheduler.step()
-                self.optimizer.zero_grad()
+            # Step 4
+            self.optimizer.step()
+            scheduler.step()
+            self.optimizer.zero_grad()
 
         # Restores the original states
         self.optimizer.load_state_dict(previous_states['optimizer'])
@@ -405,3 +457,9 @@ class Manager(object):
         ax.set_ylabel('Loss')
         fig.tight_layout()
         return tracking, fig
+
+    def adjust_target(self, sigma, switch):
+        # self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.gaussians_1 = create_gaussians(sigma, switch).to(self.device)
+        self.losses = []
+        self.total_epochs = 0
